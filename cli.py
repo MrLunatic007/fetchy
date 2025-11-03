@@ -3,6 +3,7 @@ import argparse
 import sys
 import os
 from pathlib import Path
+
 from downloader import Downloader
 from connection_manager import Connector
 import json
@@ -148,6 +149,20 @@ class CLIDownloader:
 
         console.print(f"[green]Added to queue:[/green] {url}")
 
+    def remove_from_queue(self, url):
+        """Remove a download from the queue by URL"""
+        queue = self._load_queue()
+
+        # Find all entries that don't match the given URL
+        new_queue = [item for item in queue if item["url"] != url]
+
+        if len(new_queue) == len(queue):
+            console.print(f"[red]No entry found for URL:[/red] {url}")
+            return
+
+        self._save_queue(new_queue)
+        console.print(f"[green]Removed {url} from queue[/green]")
+
     def list_queue(self):
         """List all downloads in queue"""
         queue = self._load_queue()
@@ -244,10 +259,11 @@ class CLIDownloader:
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Fetchy - Advanced Download Manager",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
+    try:
+        parser = argparse.ArgumentParser(
+            description="Fetchy - Advanced Download Manager",
+            formatter_class=argparse.RawDescriptionHelpFormatter,
+            epilog="""
 Examples:
   fetchy download https://example.com/file.zip
   fetchy download https://example.com/file.zip -o myfile.zip -t 8
@@ -255,59 +271,74 @@ Examples:
   fetchy queue
   fetchy process
   fetchy info https://example.com/file.zip
+  fetchy drop https://example.com/file.zip
         """,
-    )
+        )
 
-    subparsers = parser.add_subparsers(dest="command", help="Commands")
+        subparsers = parser.add_subparsers(dest="command", help="Commands")
 
-    # Download command
-    download_parser = subparsers.add_parser("download", help="Download a file")
-    download_parser.add_argument("url", help="URL to download")
-    download_parser.add_argument("-o", "--output", help="Output filename")
-    download_parser.add_argument(
-        "-t", "--threads", type=int, default=4, help="Number of threads (default: 4)"
-    )
-    download_parser.add_argument(
-        "-q", "--quiet", action="store_true", help="Quiet mode"
-    )
+        # Download command
+        download_parser = subparsers.add_parser("download", help="Download a file")
+        download_parser.add_argument("url", help="URL to download")
+        download_parser.add_argument("-o", "--output", help="Output filename")
+        download_parser.add_argument(
+            "-t",
+            "--threads",
+            type=int,
+            default=4,
+            help="Number of threads (default: 4)",
+        )
+        download_parser.add_argument(
+            "-q", "--quiet", action="store_true", help="Quiet mode"
+        )
 
-    # Add to queue command
-    add_parser = subparsers.add_parser("add", help="Add download to queue")
-    add_parser.add_argument("url", help="URL to download")
-    add_parser.add_argument("-o", "--output", help="Output filename")
-    add_parser.add_argument(
-        "-t", "--threads", type=int, default=4, help="Number of threads"
-    )
+        # Add to queue command
+        add_parser = subparsers.add_parser("add", help="Add download to queue")
+        add_parser.add_argument("url", help="URL to download")
+        add_parser.add_argument("-o", "--output", help="Output filename")
+        add_parser.add_argument(
+            "-t", "--threads", type=int, default=4, help="Number of threads"
+        )
+        add_parser.add_argument("--id", help="Id of the url to remove")
 
-    # Queue commands
-    subparsers.add_parser("queue", help="List download queue")
-    subparsers.add_parser("process", help="Process download queue")
-    subparsers.add_parser("clear", help="Clear completed downloads")
+        # Queue commands
+        subparsers.add_parser("queue", help="List download queue")
+        subparsers.add_parser("process", help="Process download queue")
+        subparsers.add_parser("clear", help="Clear completed downloads")
+        drop_parser = subparsers.add_parser("drop", help="Remove a URL from queue")
+        drop_parser.add_argument("url", help="URL to remove from queue")
 
-    # Info command
-    info_parser = subparsers.add_parser("info", help="Get download information")
-    info_parser.add_argument("url", help="URL to check")
+        # Info command
+        info_parser = subparsers.add_parser("info", help="Get download information")
+        info_parser.add_argument("url", help="URL to check")
 
-    args = parser.parse_args()
+        args = parser.parse_args()
 
-    if not args.command:
-        parser.print_help()
-        return
+        if not args.command:
+            parser.print_help()
+            return
 
-    cli = CLIDownloader()
+        cli = CLIDownloader()
 
-    if args.command == "download":
-        cli.download_file(args.url, args.output, args.threads, args.quiet)
-    elif args.command == "add":
-        cli.add_to_queue(args.url, args.output, args.threads)
-    elif args.command == "queue":
-        cli.list_queue()
-    elif args.command == "process":
-        cli.process_queue()
-    elif args.command == "clear":
-        cli.clear_queue()
-    elif args.command == "info":
-        cli.get_info(args.url)
+        if args.command == "download":
+            cli.download_file(args.url, args.output, args.threads, args.quiet)
+        elif args.command == "add":
+            cli.add_to_queue(args.url, args.output, args.threads)
+        elif args.command == "drop":
+            cli.remove_from_queue(args.url)
+        elif args.command == "queue":
+            cli.list_queue()
+        elif args.command == "process":
+            cli.process_queue()
+        elif args.command == "clear":
+            cli.clear_queue()
+        elif args.command == "info":
+            cli.get_info(args.url)
+    except Exception as e:
+        console.log(f"Error: {e}")
+    except KeyboardInterrupt:
+        console.log("Fetchy: Good Bye come back again...")
+        exit()
 
 
 if __name__ == "__main__":
