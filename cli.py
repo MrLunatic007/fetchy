@@ -1,40 +1,82 @@
 #!/usr/bin/env python3
 import argparse
-import sys
-import os
+import json
+import threading
+import time
 from pathlib import Path
 
 from downloader import Downloader
 from connection_manager import Connector
-import json
 from rich.console import Console
 from rich.progress import (
-    Progress,
-    SpinnerColumn,
-    BarColumn,
-    TextColumn,
-    DownloadColumn,
-    TransferSpeedColumn,
+    Progress, SpinnerColumn, BarColumn, TextColumn,
+    DownloadColumn, TransferSpeedColumn
 )
 from rich.table import Table
 from rich.panel import Panel
-import threading
-import time
-import requests
-import math
 
 
 console = Console()
 
 
-class CLIDownloader:
+class DownloadQueue:
+    """Manages download queue persistence"""
+    
     def __init__(self):
         self.queue_file = Path.home() / ".fetchy" / "queue.json"
         self.queue_file.parent.mkdir(exist_ok=True)
 
+    def load(self):
+        """Load queue from disk"""
+        if self.queue_file.exists():
+            with open(self.queue_file, "r") as f:
+                return json.load(f)
+        return []
+
+    def save(self, queue):
+        """Save queue to disk"""
+        with open(self.queue_file, "w") as f:
+            json.dump(queue, f, indent=2)
+
+    def add(self, url, output=None, threads=4):
+        """Add item to queue"""
+        queue = self.load()
+        queue.append({
+            "url": url,
+            "output": output,
+            "threads": threads,
+            "status": "pending"
+        })
+        self.save(queue)
+
+    def remove(self, url):
+        """Remove item from queue"""
+        queue = self.load()
+        new_queue = [item for item in queue if item["url"] != url]
+        
+        if len(new_queue) == len(queue):
+            return False
+        
+        self.save(new_queue)
+        return True
+
+    def clear_completed(self):
+        """Remove completed items"""
+        queue = self.load()
+        queue = [item for item in queue if item["status"] != "completed"]
+        self.save(queue)
+
+
+class CLIDownloader:
+    """CLI interface for downloads"""
+    
+    def __init__(self):
+        self.queue = DownloadQueue()
+
     def download_file(self, url, output=None, threads=4, quiet=False):
         """Download a single file with progress"""
         try:
+            # Get file info
             connector = Connector(url)
             content = connector.connect()
 
@@ -43,14 +85,24 @@ class CLIDownloader:
                 return False
 
             filename = output or content.get("filename", "download_file")
-            total_size = int(content.get("size", 0))
+            
+            # Handle None size
+            size = content.get("size")
+            total_size = int(size) if size else 0
+            
+            if total_size == 0:
+                console.print("[yellow]Warning: Could not determine file size. Download may not show accurate progress.[/yellow]")
 
             if not quiet:
-                console.print(f"[cyan]Downloading:[/cyan] {filename}")
-                console.print(f"[cyan]Size:[/cyan] {total_size / (1024*1024):.2f} MB")
-                console.print(f"[cyan]Threads:[/cyan] {threads}")
+                size_display = f"{total_size / (1024*1024):.2f} MB" if total_size > 0 else "Unknown"
+                console.print(f"[cyan]File:[/cyan] {filename}")
+                console.print(f"[cyan]Size:[/cyan] {size_display}")
+                console.print(f"[cyan]Threads:[/cyan] {threads}\n")
 
-            # Download with progress
+            # Create downloader
+            downloader = Downloader(url)
+
+            # Progress tracking
             with Progress(
                 SpinnerColumn(),
                 TextColumn("[progress.description]{task.description}"),
@@ -59,37 +111,28 @@ class CLIDownloader:
                 DownloadColumn(),
                 TransferSpeedColumn(),
             ) as progress:
-                task = progress.add_task("[cyan]Downloading...", total=total_size)
+                # Use None for total if size is unknown
+                task = progress.add_task(
+                    "[cyan]Downloading...", 
+                    total=total_size if total_size > 0 else None
+                )
 
-                # Split and download
-                ranges = self._split_ranges(total_size, threads)
-                downloaded = [0] * threads
-                threads_list = []
-
-                for i, (start, end) in enumerate(ranges):
-                    t = threading.Thread(
-                        target=self._download_chunk,
-                        args=(url, start, end, filename, i, downloaded),
-                    )
-                    t.start()
-                    threads_list.append(t)
+                # Start download in thread
+                download_thread = threading.Thread(
+                    target=downloader.download,
+                    args=(filename, threads)
+                )
+                download_thread.start()
 
                 # Update progress
-                while any(t.is_alive() for t in threads_list):
-                    total_downloaded = sum(downloaded)
-                    progress.update(task, completed=total_downloaded)
+                while download_thread.is_alive():
+                    downloaded = downloader.get_progress()
+                    progress.update(task, completed=downloaded)
                     time.sleep(0.1)
 
-                for t in threads_list:
-                    t.join()
-
-                progress.update(task, completed=total_size)
-
-            # Merge parts
-            if not quiet:
-                console.print("[yellow]Merging parts...[/yellow]")
-
-            self._merge_parts(filename, threads)
+                download_thread.join()
+                if total_size > 0:
+                    progress.update(task, completed=total_size)
 
             if not quiet:
                 console.print(f"[green]✓ Download completed:[/green] {filename}")
@@ -100,72 +143,21 @@ class CLIDownloader:
             console.print(f"[red]Error: {e}[/red]")
             return False
 
-    def _split_ranges(self, total_size, num_chunks):
-        chunks = []
-        chunk_size = math.ceil(total_size / num_chunks)
-        for i in range(num_chunks):
-            start = i * chunk_size
-            end = min(start + chunk_size - 1, total_size - 1)
-            chunks.append((start, end))
-        return chunks
-
-    def _download_chunk(self, url, start, end, filename, part_num, downloaded):
-        headers = {"Range": f"bytes={start}-{end}"}
-        part_path = f"{filename}.part{part_num}"
-
-        try:
-            r = requests.get(url, headers=headers, stream=True)
-            if r.status_code in (200, 206):
-                with open(part_path, "wb") as f:
-                    for chunk in r.iter_content(chunk_size=8192):
-                        if chunk:
-                            f.write(chunk)
-                            downloaded[part_num] += len(chunk)
-        except Exception as e:
-            console.print(f"[red]Chunk {part_num} error: {e}[/red]")
-
-    def _merge_parts(self, filename, num_threads):
-        with open(filename, "wb") as outfile:
-            for i in range(num_threads):
-                part_path = f"{filename}.part{i}"
-                if os.path.exists(part_path):
-                    with open(part_path, "rb") as infile:
-                        outfile.write(infile.read())
-                    os.remove(part_path)
-
     def add_to_queue(self, url, output=None, threads=4):
         """Add download to queue"""
-        queue = self._load_queue()
-
-        download = {
-            "url": url,
-            "output": output,
-            "threads": threads,
-            "status": "pending",
-        }
-
-        queue.append(download)
-        self._save_queue(queue)
-
+        self.queue.add(url, output, threads)
         console.print(f"[green]Added to queue:[/green] {url}")
 
     def remove_from_queue(self, url):
-        """Remove a download from the queue by URL"""
-        queue = self._load_queue()
-
-        # Find all entries that don't match the given URL
-        new_queue = [item for item in queue if item["url"] != url]
-
-        if len(new_queue) == len(queue):
-            console.print(f"[red]No entry found for URL:[/red] {url}")
-            return
-
-        self._save_queue(new_queue)
-        console.print(f"[green]Removed {url} from queue[/green]")
+        """Remove download from queue"""
+        if self.queue.remove(url):
+            console.print(f"[green]Removed from queue:[/green] {url}")
+        else:
+            console.print(f"[red]URL not found in queue[/red]")
 
     def list_queue(self):
-        """List all downloads in queue"""
-        queue = self._load_queue()
+        """Display queue contents"""
+        queue = self.queue.load()
 
         if not queue:
             console.print("[yellow]Queue is empty[/yellow]")
@@ -179,49 +171,51 @@ class CLIDownloader:
         table.add_column("Status", style="yellow")
 
         for i, item in enumerate(queue):
+            url_display = item["url"][:50] + "..." if len(item["url"]) > 50 else item["url"]
             table.add_row(
                 str(i),
-                item["url"][:50] + "..." if len(item["url"]) > 50 else item["url"],
-                item.get("output", "auto") or "auto",
+                url_display,
+                item.get("output") or "auto",
                 str(item.get("threads", 4)),
-                item.get("status", "pending"),
+                item.get("status", "pending")
             )
 
         console.print(table)
 
     def process_queue(self):
-        """Process all downloads in queue"""
-        queue = self._load_queue()
+        """Process all pending downloads"""
+        queue = self.queue.load()
 
         if not queue:
             console.print("[yellow]Queue is empty[/yellow]")
             return
 
-        console.print(f"[cyan]Processing {len(queue)} downloads...[/cyan]\n")
+        pending = [item for item in queue if item["status"] == "pending"]
+        console.print(f"[cyan]Processing {len(pending)} downloads...[/cyan]\n")
 
         for i, item in enumerate(queue):
-            if item["status"] == "completed":
+            if item["status"] != "pending":
                 continue
 
-            console.print(f"\n[bold cyan]Download {i+1}/{len(queue)}[/bold cyan]")
+            console.print(f"\n[bold cyan]Download {i+1}/{len(pending)}[/bold cyan]")
             success = self.download_file(
-                item["url"], item.get("output"), item.get("threads", 4)
+                item["url"],
+                item.get("output"),
+                item.get("threads", 4)
             )
 
             item["status"] = "completed" if success else "failed"
-            self._save_queue(queue)
+            self.queue.save(queue)
 
         console.print("\n[green]✓ Queue processing completed[/green]")
 
-    def clear_queue(self):
-        """Clear completed downloads from queue"""
-        queue = self._load_queue()
-        queue = [item for item in queue if item["status"] != "completed"]
-        self._save_queue(queue)
+    def clear_completed(self):
+        """Clear completed downloads"""
+        self.queue.clear_completed()
         console.print("[green]Cleared completed downloads[/green]")
 
     def get_info(self, url):
-        """Get information about a URL"""
+        """Display file information"""
         try:
             connector = Connector(url)
             content = connector.connect()
@@ -230,14 +224,24 @@ class CLIDownloader:
                 console.print("[red]Failed to connect to URL[/red]")
                 return
 
+            # Handle None size
+            size = content.get("size")
+            if size:
+                size_mb = int(size) / (1024 * 1024)
+                size_display = f"{size_mb:.2f} MB"
+            else:
+                size_display = "Unknown"
+
+            supports_range = "Yes" if content.get("supports_resume") else "No"
+
             info = Panel(
                 f"""[cyan]URL:[/cyan] {url}
 [cyan]Filename:[/cyan] {content.get('filename', 'N/A')}
-[cyan]Size:[/cyan] {int(content.get('size', 0)) / (1024*1024):.2f} MB
+[cyan]Size:[/cyan] {size_display}
 [cyan]Type:[/cyan] {content.get('type', 'N/A')}
-[cyan]Supports Range:[/cyan] {'Yes' if content.get('range') == 'bytes' else 'No'}""",
+[cyan]Supports Range:[/cyan] {supports_range}""",
                 title="Download Information",
-                border_style="cyan",
+                border_style="cyan"
             )
 
             console.print(info)
@@ -245,25 +249,12 @@ class CLIDownloader:
         except Exception as e:
             console.print(f"[red]Error: {e}[/red]")
 
-    def _load_queue(self):
-        """Load queue from file"""
-        if self.queue_file.exists():
-            with open(self.queue_file, "r") as f:
-                return json.load(f)
-        return []
-
-    def _save_queue(self, queue):
-        """Save queue to file"""
-        with open(self.queue_file, "w") as f:
-            json.dump(queue, f, indent=2)
-
 
 def main():
-    try:
-        parser = argparse.ArgumentParser(
-            description="Fetchy - Advanced Download Manager",
-            formatter_class=argparse.RawDescriptionHelpFormatter,
-            epilog="""
+    parser = argparse.ArgumentParser(
+        description="Fetchy - Advanced Download Manager",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
 Examples:
   fetchy download https://example.com/file.zip
   fetchy download https://example.com/file.zip -o myfile.zip -t 8
@@ -272,54 +263,44 @@ Examples:
   fetchy process
   fetchy info https://example.com/file.zip
   fetchy drop https://example.com/file.zip
-        """,
-        )
+        """
+    )
 
-        subparsers = parser.add_subparsers(dest="command", help="Commands")
+    subparsers = parser.add_subparsers(dest="command", help="Commands")
 
-        # Download command
-        download_parser = subparsers.add_parser("download", help="Download a file")
-        download_parser.add_argument("url", help="URL to download")
-        download_parser.add_argument("-o", "--output", help="Output filename")
-        download_parser.add_argument(
-            "-t",
-            "--threads",
-            type=int,
-            default=4,
-            help="Number of threads (default: 4)",
-        )
-        download_parser.add_argument(
-            "-q", "--quiet", action="store_true", help="Quiet mode"
-        )
+    # Download command
+    download_parser = subparsers.add_parser("download", help="Download a file")
+    download_parser.add_argument("url", help="URL to download")
+    download_parser.add_argument("-o", "--output", help="Output filename")
+    download_parser.add_argument("-t", "--threads", type=int, default=4, help="Number of threads")
+    download_parser.add_argument("-q", "--quiet", action="store_true", help="Quiet mode")
 
-        # Add to queue command
-        add_parser = subparsers.add_parser("add", help="Add download to queue")
-        add_parser.add_argument("url", help="URL to download")
-        add_parser.add_argument("-o", "--output", help="Output filename")
-        add_parser.add_argument(
-            "-t", "--threads", type=int, default=4, help="Number of threads"
-        )
-        add_parser.add_argument("--id", help="Id of the url to remove")
+    # Queue commands
+    add_parser = subparsers.add_parser("add", help="Add download to queue")
+    add_parser.add_argument("url", help="URL to download")
+    add_parser.add_argument("-o", "--output", help="Output filename")
+    add_parser.add_argument("-t", "--threads", type=int, default=4, help="Number of threads")
 
-        # Queue commands
-        subparsers.add_parser("queue", help="List download queue")
-        subparsers.add_parser("process", help="Process download queue")
-        subparsers.add_parser("clear", help="Clear completed downloads")
-        drop_parser = subparsers.add_parser("drop", help="Remove a URL from queue")
-        drop_parser.add_argument("url", help="URL to remove from queue")
+    drop_parser = subparsers.add_parser("drop", help="Remove URL from queue")
+    drop_parser.add_argument("url", help="URL to remove")
 
-        # Info command
-        info_parser = subparsers.add_parser("info", help="Get download information")
-        info_parser.add_argument("url", help="URL to check")
+    subparsers.add_parser("queue", help="List download queue")
+    subparsers.add_parser("process", help="Process download queue")
+    subparsers.add_parser("clear", help="Clear completed downloads")
 
-        args = parser.parse_args()
+    # Info command
+    info_parser = subparsers.add_parser("info", help="Get download information")
+    info_parser.add_argument("url", help="URL to check")
 
-        if not args.command:
-            parser.print_help()
-            return
+    args = parser.parse_args()
 
-        cli = CLIDownloader()
+    if not args.command:
+        parser.print_help()
+        return
 
+    cli = CLIDownloader()
+
+    try:
         if args.command == "download":
             cli.download_file(args.url, args.output, args.threads, args.quiet)
         elif args.command == "add":
@@ -331,14 +312,13 @@ Examples:
         elif args.command == "process":
             cli.process_queue()
         elif args.command == "clear":
-            cli.clear_queue()
+            cli.clear_completed()
         elif args.command == "info":
             cli.get_info(args.url)
-    except Exception as e:
-        console.log(f"Error: {e}")
     except KeyboardInterrupt:
-        console.log("Fetchy: Good Bye come back again...")
-        exit()
+        console.print("\n[yellow]Interrupted by user[/yellow]")
+    except Exception as e:
+        console.print(f"[red]Error: {e}[/red]")
 
 
 if __name__ == "__main__":

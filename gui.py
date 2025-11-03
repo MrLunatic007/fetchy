@@ -1,10 +1,12 @@
+#!/usr/bin/env python3
 import sys
 import os
-
-# Add current directory to path for imports
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-
+import threading
+import time
+import math
+import requests
 from pathlib import Path
+
 from PyQt6.QtWidgets import (
     QApplication,
     QMainWindow,
@@ -23,16 +25,15 @@ from PyQt6.QtWidgets import (
     QHeaderView,
     QMenu,
 )
-from PyQt6.QtCore import QThread, pyqtSignal, Qt, QTimer
+from PyQt6.QtCore import QThread, pyqtSignal, Qt
 from PyQt6.QtGui import QAction
-import threading
-import time
-import requests
+
 from connection_manager import Connector
-import math
 
 
 class DownloadWorker(QThread):
+    """Worker thread for downloading files"""
+
     progress = pyqtSignal(int, float, str)  # row, progress, speed
     finished = pyqtSignal(int, bool, str)  # row, success, message
 
@@ -48,59 +49,50 @@ class DownloadWorker(QThread):
         self.lock = threading.Lock()
 
     def run(self):
+        """Execute download"""
         try:
-            # Add User-Agent header
-            headers = {
-                "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"
-            }
-
-            # Get file info with longer timeout
-            connector = Connector(self.url)
+            # Get file info
+            connector = Connector(self.url, timeout=60)
             content = connector.connect()
 
             if not content:
-                self.finished.emit(self.row, False, "Failed to connect")
+                self.finished.emit(self.row, False, "Connection failed")
                 return
 
-            total_size = int(content.get("size", 0))
+            # Handle None size
+            size = content.get("size")
+            total_size = int(size) if size else 0
+
             if total_size == 0:
                 self.finished.emit(self.row, False, "Invalid file size")
                 return
 
-            # Check if server supports ranges
+            # Adjust threads based on server support
             supports_ranges = content.get("supports_resume", False)
-            actual_threads = 1 if not supports_ranges else self.num_threads
+            num_threads = 1 if not supports_ranges else self.num_threads
 
-            if actual_threads != self.num_threads:
-                print(
-                    f"Server doesn't support ranges, using 1 thread instead of {self.num_threads}"
-                )
-
-            # Download with progress tracking
-            success = self._parallel_download(total_size, actual_threads)
-
-            if success and self.is_running and not self.is_paused:
-                # Merge files
-                self._merge_parts(actual_threads)
+            # Download
+            if self._parallel_download(total_size, num_threads):
+                self._merge_parts(num_threads)
                 self.finished.emit(self.row, True, "Completed")
-            elif not self.is_running:
-                self._cleanup_parts(actual_threads)
+            else:
+                self._cleanup_parts(num_threads)
                 self.finished.emit(self.row, False, "Cancelled")
 
         except requests.exceptions.Timeout:
             self.finished.emit(self.row, False, "Connection timeout")
-        except requests.exceptions.ConnectionError:
-            self.finished.emit(self.row, False, "Connection error")
         except Exception as e:
             self.finished.emit(self.row, False, str(e))
 
     def _parallel_download(self, total_size, num_threads):
+        """Download file in parallel chunks"""
         ranges = self._split_ranges(total_size, num_threads)
         threads = []
         self.downloaded = [0] * num_threads
         start_time = time.time()
         last_update = start_time
 
+        # Start download threads
         for i, (start, end) in enumerate(ranges):
             t = threading.Thread(target=self._download_chunk, args=(start, end, i))
             t.daemon = True
@@ -116,19 +108,17 @@ class DownloadWorker(QThread):
                 time.sleep(0.1)
 
             current_time = time.time()
-
-            # Update progress every 0.5 seconds
             if current_time - last_update >= 0.5:
                 with self.lock:
                     total_downloaded = sum(self.downloaded)
 
-                progress = (total_downloaded / total_size) * 100
-
+                progress_pct = (total_downloaded / total_size) * 100
                 elapsed = current_time - start_time
-                speed = total_downloaded / elapsed if elapsed > 0 else 0
-                speed_mb = speed / (1024 * 1024)
+                speed_mbps = (
+                    (total_downloaded / elapsed / (1024 * 1024)) if elapsed > 0 else 0
+                )
 
-                self.progress.emit(self.row, progress, f"{speed_mb:.2f} MB/s")
+                self.progress.emit(self.row, progress_pct, f"{speed_mbps:.2f} MB/s")
                 last_update = current_time
 
             time.sleep(0.1)
@@ -139,15 +129,15 @@ class DownloadWorker(QThread):
         return self.is_running and not self.is_paused
 
     def _split_ranges(self, total_size, num_chunks):
-        chunks = []
+        """Split file into byte ranges"""
         chunk_size = math.ceil(total_size / num_chunks)
-        for i in range(num_chunks):
-            start = i * chunk_size
-            end = min(start + chunk_size - 1, total_size - 1)
-            chunks.append((start, end))
-        return chunks
+        return [
+            (i * chunk_size, min((i + 1) * chunk_size - 1, total_size - 1))
+            for i in range(num_chunks)
+        ]
 
     def _download_chunk(self, start, end, part_num):
+        """Download a specific byte range"""
         headers = {
             "Range": f"bytes={start}-{end}",
             "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36",
@@ -155,7 +145,6 @@ class DownloadWorker(QThread):
         part_path = f"{self.save_path}.part{part_num}"
 
         try:
-            # Increase timeout for GUI
             r = requests.get(self.url, headers=headers, stream=True, timeout=60)
 
             if r.status_code in (200, 206):
@@ -171,27 +160,22 @@ class DownloadWorker(QThread):
                             f.write(chunk)
                             with self.lock:
                                 self.downloaded[part_num] += len(chunk)
-            else:
-                print(f"Chunk {part_num} failed with status {r.status_code}")
 
-        except requests.exceptions.Timeout:
-            print(f"Chunk {part_num} timeout")
         except Exception as e:
             print(f"Chunk {part_num} error: {e}")
 
     def _merge_parts(self, num_threads):
-        try:
-            with open(self.save_path, "wb") as outfile:
-                for i in range(num_threads):
-                    part_path = f"{self.save_path}.part{i}"
-                    if os.path.exists(part_path):
-                        with open(part_path, "rb") as infile:
-                            outfile.write(infile.read())
-                        os.remove(part_path)
-        except Exception as e:
-            print(f"Error merging: {e}")
+        """Merge downloaded parts"""
+        with open(self.save_path, "wb") as outfile:
+            for i in range(num_threads):
+                part_path = f"{self.save_path}.part{i}"
+                if os.path.exists(part_path):
+                    with open(part_path, "rb") as infile:
+                        outfile.write(infile.read())
+                    os.remove(part_path)
 
     def _cleanup_parts(self, num_threads):
+        """Remove temporary files"""
         for i in range(num_threads):
             part_path = f"{self.save_path}.part{i}"
             if os.path.exists(part_path):
@@ -211,13 +195,15 @@ class DownloadWorker(QThread):
 
 
 class DownloadManagerGUI(QMainWindow):
+    """Main GUI window for download manager"""
+
     def __init__(self):
         super().__init__()
-        self.downloads = []
         self.workers = {}
         self.init_ui()
 
     def init_ui(self):
+        """Initialize user interface"""
         self.setWindowTitle("Fetchy Download Manager")
         self.setGeometry(100, 100, 1000, 600)
 
@@ -229,6 +215,7 @@ class DownloadManagerGUI(QMainWindow):
         # URL input section
         url_layout = QHBoxLayout()
         url_layout.addWidget(QLabel("URL:"))
+
         self.url_input = QLineEdit()
         self.url_input.setPlaceholderText("Enter download URL...")
         self.url_input.returnPressed.connect(self.add_download)
@@ -236,8 +223,7 @@ class DownloadManagerGUI(QMainWindow):
 
         url_layout.addWidget(QLabel("Threads:"))
         self.threads_spin = QSpinBox()
-        self.threads_spin.setMinimum(1)
-        self.threads_spin.setMaximum(16)
+        self.threads_spin.setRange(1, 16)
         self.threads_spin.setValue(4)
         url_layout.addWidget(self.threads_spin)
 
@@ -263,29 +249,26 @@ class DownloadManagerGUI(QMainWindow):
         # Control buttons
         btn_layout = QHBoxLayout()
 
-        self.pause_btn = QPushButton("Pause Selected")
-        self.pause_btn.clicked.connect(self.pause_selected)
-        btn_layout.addWidget(self.pause_btn)
+        buttons = [
+            ("Pause Selected", self.pause_selected),
+            ("Resume Selected", self.resume_selected),
+            ("Cancel Selected", self.cancel_selected),
+            ("Clear Completed", self.clear_completed),
+        ]
 
-        self.resume_btn = QPushButton("Resume Selected")
-        self.resume_btn.clicked.connect(self.resume_selected)
-        btn_layout.addWidget(self.resume_btn)
-
-        self.cancel_btn = QPushButton("Cancel Selected")
-        self.cancel_btn.clicked.connect(self.cancel_selected)
-        btn_layout.addWidget(self.cancel_btn)
-
-        self.clear_btn = QPushButton("Clear Completed")
-        self.clear_btn.clicked.connect(self.clear_completed)
-        btn_layout.addWidget(self.clear_btn)
+        for text, handler in buttons:
+            btn = QPushButton(text)
+            btn.clicked.connect(handler)
+            btn_layout.addWidget(btn)
 
         layout.addLayout(btn_layout)
 
-        # Status bar
         self.statusBar().showMessage("Ready")
 
     def add_download(self):
+        """Add new download to table"""
         url = self.url_input.text().strip()
+
         if not url:
             QMessageBox.warning(self, "Error", "Please enter a URL")
             return
@@ -296,34 +279,29 @@ class DownloadManagerGUI(QMainWindow):
             )
             return
 
-        self.statusBar().showMessage("Connecting to server...")
+        self.statusBar().showMessage("Connecting...")
         QApplication.processEvents()
 
         try:
-            # Get file info with timeout
+            # Get file info
             connector = Connector(url)
             content = connector.connect()
 
             if not content:
-                QMessageBox.warning(
-                    self,
-                    "Error",
-                    "Failed to connect to URL. Check your internet connection and try again.",
-                )
+                QMessageBox.warning(self, "Error", "Failed to connect to URL")
                 self.statusBar().showMessage("Connection failed")
                 return
 
             filename = content.get("filename", "download_file")
-            size = int(content.get("size", 0))
-            size_mb = size / (1024 * 1024)
+            size_mb = int(content.get("size", 0)) / (1024 * 1024)
 
-            # Ask for save location
+            # Choose save location
             save_path, _ = QFileDialog.getSaveFileName(
                 self, "Save File", filename, "All Files (*.*)"
             )
 
             if not save_path:
-                self.statusBar().showMessage("Download cancelled")
+                self.statusBar().showMessage("Cancelled")
                 return
 
             # Add to table
@@ -339,6 +317,7 @@ class DownloadManagerGUI(QMainWindow):
             self.table.setItem(row, 3, QTableWidgetItem("0 MB/s"))
             self.table.setItem(row, 4, QTableWidgetItem("Starting..."))
 
+            # Action buttons
             action_widget = QWidget()
             action_layout = QHBoxLayout(action_widget)
             action_layout.setContentsMargins(0, 0, 0, 0)
@@ -366,83 +345,73 @@ class DownloadManagerGUI(QMainWindow):
             self.statusBar().showMessage(f"Download started: {filename}")
 
         except Exception as e:
-            QMessageBox.critical(self, "Error", f"Error adding download: {str(e)}")
-            self.statusBar().showMessage("Error occurred")
+            QMessageBox.critical(self, "Error", f"Failed to add download: {str(e)}")
+            self.statusBar().showMessage("Error")
 
     def update_progress(self, row, progress, speed):
+        """Update download progress in table"""
         if row < self.table.rowCount():
-            progress_bar = self.table.cellWidget(row, 2)
-            if progress_bar:
+            if progress_bar := self.table.cellWidget(row, 2):
                 progress_bar.setValue(int(progress))
 
-            speed_item = self.table.item(row, 3)
-            if speed_item:
+            if speed_item := self.table.item(row, 3):
                 speed_item.setText(speed)
 
-            status_item = self.table.item(row, 4)
-            if status_item:
+            if status_item := self.table.item(row, 4):
                 status_item.setText("Downloading...")
 
     def download_finished(self, row, success, message):
+        """Handle download completion"""
         if row < self.table.rowCount():
             status = "Completed" if success else f"Failed: {message}"
-            status_item = self.table.item(row, 4)
-            if status_item:
+
+            if status_item := self.table.item(row, 4):
                 status_item.setText(status)
 
             if success:
-                progress_bar = self.table.cellWidget(row, 2)
-                if progress_bar:
+                if progress_bar := self.table.cellWidget(row, 2):
                     progress_bar.setValue(100)
-                self.statusBar().showMessage(
-                    f"Download completed: {self.table.item(row, 0).text()}"
-                )
+                filename = self.table.item(row, 0).text()
+                self.statusBar().showMessage(f"Completed: {filename}")
             else:
-                self.statusBar().showMessage(f"Download failed: {message}")
+                self.statusBar().showMessage(f"Failed: {message}")
 
     def pause_download(self, row):
         if row in self.workers:
             self.workers[row].pause()
-            status_item = self.table.item(row, 4)
-            if status_item:
-                status_item.setText("Paused")
+            if item := self.table.item(row, 4):
+                item.setText("Paused")
 
     def resume_download(self, row):
         if row in self.workers:
             self.workers[row].resume()
-            status_item = self.table.item(row, 4)
-            if status_item:
-                status_item.setText("Resuming...")
+            if item := self.table.item(row, 4):
+                item.setText("Resuming...")
 
     def cancel_download(self, row):
         if row in self.workers:
             self.workers[row].stop()
-            status_item = self.table.item(row, 4)
-            if status_item:
-                status_item.setText("Cancelled")
+            if item := self.table.item(row, 4):
+                item.setText("Cancelled")
 
     def pause_selected(self):
-        row = self.table.currentRow()
-        if row >= 0:
+        if (row := self.table.currentRow()) >= 0:
             self.pause_download(row)
 
     def resume_selected(self):
-        row = self.table.currentRow()
-        if row >= 0:
+        if (row := self.table.currentRow()) >= 0:
             self.resume_download(row)
 
     def cancel_selected(self):
-        row = self.table.currentRow()
-        if row >= 0:
+        if (row := self.table.currentRow()) >= 0:
             self.cancel_download(row)
 
     def clear_completed(self):
+        """Remove completed/failed downloads"""
         rows_to_remove = []
         for row in range(self.table.rowCount()):
-            status_item = self.table.item(row, 4)
-            if status_item:
-                status = status_item.text()
-                if "Completed" in status or "Failed" in status or "Cancelled" in status:
+            if item := self.table.item(row, 4):
+                if any(s in item.text() for s in ["Completed", "Failed", "Cancelled"]):
                     rows_to_remove.append(row)
 
         for row in reversed(rows_to_remove):
@@ -453,25 +422,28 @@ class DownloadManagerGUI(QMainWindow):
         self.statusBar().showMessage(f"Cleared {len(rows_to_remove)} downloads")
 
     def show_context_menu(self, pos):
-        row = self.table.rowAt(pos.y())
-        if row >= 0:
+        """Show right-click context menu"""
+        if (row := self.table.rowAt(pos.y())) >= 0:
             menu = QMenu()
-            pause_action = menu.addAction("Pause")
-            resume_action = menu.addAction("Resume")
-            cancel_action = menu.addAction("Cancel")
+            actions = {
+                "Pause": lambda: self.pause_download(row),
+                "Resume": lambda: self.resume_download(row),
+                "Cancel": lambda: self.cancel_download(row),
+            }
 
-            action = menu.exec(self.table.viewport().mapToGlobal(pos))
+            for name, handler in actions.items():
+                action = menu.addAction(name)
+                action.triggered.connect(handler)
 
-            if action == pause_action:
-                self.pause_download(row)
-            elif action == resume_action:
-                self.resume_download(row)
-            elif action == cancel_action:
-                self.cancel_download(row)
+            menu.exec(self.table.viewport().mapToGlobal(pos))
 
 
-if __name__ == "__main__":
+def main():
     app = QApplication(sys.argv)
     window = DownloadManagerGUI()
     window.show()
     sys.exit(app.exec())
+
+
+if __name__ == "__main__":
+    main()
