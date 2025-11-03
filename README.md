@@ -10,8 +10,6 @@ A powerful download manager for Linux with GUI, CLI, and Firefox browser integra
 
 ⚡ **Powerful CLI**: Full-featured command-line interface for automation
 
-🦊 **Firefox Integration**: Browser extension to intercept downloads automatically
-
 📊 **Download Queue**: Manage multiple downloads with pause/resume support
 
 🔄 **Resume Support**: Continue interrupted downloads from where they left off
@@ -22,13 +20,12 @@ A powerful download manager for Linux with GUI, CLI, and Firefox browser integra
 
 - Python 3.8 or higher
 - pip (Python package manager)
-- Firefox or Firefox-based browser (for extension)
 
 ### Quick Install
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/fetchy.git
+git clone https://github.com/MrLunatic007/fetchy.git
 cd fetchy
 
 # Run the installation script
@@ -40,7 +37,6 @@ The script will:
 - Install Python dependencies (requests, PyQt6, rich)
 - Create CLI and GUI launchers
 - Set up the desktop entry
-- Configure native messaging for Firefox
 
 ## Usage
 
@@ -85,37 +81,6 @@ Features:
 - Adjust number of threads per download
 - Right-click context menu for quick actions
 
-### Firefox Extension
-
-#### Installation
-
-1. Open Firefox and navigate to: `about:debugging#/runtime/this-firefox`
-2. Click "Load Temporary Add-on"
-3. Navigate to the `extension/` folder and select `manifest.json`
-4. Copy the extension ID that appears
-5. Edit `~/.mozilla/native-messaging-hosts/com.fetchy.downloader.json`
-6. Replace `{YOUR_EXTENSION_ID}@fetchy.com` with your actual extension ID
-
-#### Usage
-
-Once installed, the extension will:
-- Automatically intercept downloads larger than 1 MB
-- Send them to Fetchy for accelerated downloading
-- Show notifications when downloads are added
-
-You can:
-- Toggle auto-intercept on/off from the extension popup
-- Adjust minimum file size threshold
-- Manually add URLs through the popup
-- Right-click links and select "Download with Fetchy"
-
-#### Supported Browsers
-
-- Firefox
-- Librewolf
-- Waterfox
-- Other Firefox-based browsers
-
 ## Project Structure
 
 ```
@@ -127,12 +92,6 @@ fetchy/
 ├── cli.py                  # CLI interface
 ├── native_host.py          # Browser native messaging host
 ├── setup.sh                # Installation script
-├── extension/              # Firefox extension
-│   ├── manifest.json
-│   ├── background.js
-│   ├── popup.html
-│   ├── popup.js
-│   └── icons/
 └── README.md
 ```
 
@@ -192,22 +151,6 @@ fetchy download https://example.com/file.zip -t 2
 
 ## Troubleshooting
 
-### Extension not connecting to Fetchy
-
-1. Verify native messaging host path:
-   ```bash
-   cat ~/.mozilla/native-messaging-hosts/com.fetchy.downloader.json
-   ```
-
-2. Check if the path points to your `native_host.py`
-
-3. Ensure `native_host.py` is executable:
-   ```bash
-   chmod +x native_host.py
-   ```
-
-4. Check extension ID matches in the manifest
-
 ### Downloads failing
 
 1. Check internet connection
@@ -253,7 +196,6 @@ The codebase is modular:
 - Extend `connection_manager.py` for new protocols
 - Modify `downloader.py` for download logic
 - Update `gui.py` or `cli.py` for interface changes
-- Edit extension files for browser integration
 
 ## Contributing
 
@@ -271,7 +213,6 @@ MIT License - feel free to use and modify
 
 - Inspired by IDM and XDM
 - Built with PyQt6, requests, and rich
-- Firefox extension API
 
 ## Support
 
