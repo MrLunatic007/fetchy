@@ -119,8 +119,6 @@ fetchy/
 ├── downloader.py           # Core download engine
 ├── gui.py                  # PyQt6 GUI application
 ├── cli.py                  # CLI interface
-├── native_host.py          # Browser native messaging host
-├── setup.sh                # Installation script
 └── README.md
 ```
 
