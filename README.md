@@ -28,15 +28,44 @@ A powerful download manager for Linux with GUI, CLI, and Firefox browser integra
 git clone https://github.com/MrLunatic007/fetchy.git
 cd fetchy
 
-# Run the installation script
-chmod +x setup.sh
-./setup.sh
+# Run the cli interface
+python cli.py
 ```
 
-The script will:
-- Install Python dependencies (requests, PyQt6, rich)
-- Create CLI and GUI launchers
-- Set up the desktop entry
+You Could decide to build the apps using PyInstaller.
+
+```bash
+pip install PyInstaller
+pyinstaller --onefile --noconsole --name fetchy cli.py
+```
+
+And also the gui file
+
+```bash
+pyinstaller --onefile --noconsole --name fetchy-gui gui.py
+```
+
+move the compiled binaries to /usr/bin
+
+```bash
+sudo cp dist/fetchy /usr/local/bin/ # For fetchy-cli
+sudo cp dist/fetchy-gui /usr/local/bin # For fetchy-gui
+```
+
+For the GUI, make a desktop instance
+
+```bash
+# Inside /usr/share/applications/fetchy.desktop paste the following
+
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Fetchy Download Manager
+Comment=A Linux native Download Manager
+Exec=/usr/local/bin/fetchy-gui
+Terminal=false
+Category=Network;FileTransfer
+```
 
 ## Usage
 
